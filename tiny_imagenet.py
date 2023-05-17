@@ -23,6 +23,9 @@ import torchvision.transforms as transforms
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import Subset
 
+from torch.utils.tensorboard import SummaryWriter
+writer = SummaryWriter()
+
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(models.__dict__[name]))
@@ -55,6 +58,8 @@ parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float,
                     dest='weight_decay')
 parser.add_argument('-p', '--print-freq', default=10, type=int,
                     metavar='N', help='print frequency (default: 10)')
+parser.add_argument('-p', '--log-freq', default=10, type=int,
+                    metavar='N', help='print frequency (default: 10)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
 parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
@@ -81,6 +86,32 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
 parser.add_argument('--dummy', action='store_true', help="use fake data to benchmark")
 
 best_acc1 = 0
+
+def log_layer_sizes(model, input_tensor):
+    layer_sizes = {}
+
+    def get_layer_output_size(module, input, output):
+        layer_sizes[module.__class__.__name__] = output.shape[1]
+
+    # Register the forward hooks
+    handles = []
+    for name, layer in model.named_modules():
+        handle = layer.register_forward_hook(get_layer_output_size)
+        handles.append(handle)
+
+    # Do a forward pass
+    with torch.no_grad():
+        model(input_tensor)
+
+    # Remove the forward hooks
+    for handle in handles:
+        handle.remove()
+
+    # Log the sizes
+    for layer_name, size in layer_sizes.items():
+        writer.add_scalar(f'{layer_name}_output_size', size)
+
+
 
 
 class TinyImageNetDataset(torch.utils.data.Dataset):
@@ -149,6 +180,8 @@ def main():
     else:
         # Simply call main_worker function
         main_worker(args.gpu, ngpus_per_node, args)
+        writer.close()
+
 
 
 def main_worker(gpu, ngpus_per_node, args):
@@ -290,7 +323,8 @@ def main_worker(gpu, ngpus_per_node, args):
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
         num_workers=args.workers, pin_memory=True, sampler=train_sampler)
-
+    example_images, _ = next(iter(train_loader))
+    log_layer_sizes(model, example_images)
     val_loader = torch.utils.data.DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False,
         num_workers=args.workers, pin_memory=True, sampler=val_sampler)
@@ -307,7 +341,7 @@ def main_worker(gpu, ngpus_per_node, args):
         train(train_loader, model, criterion, optimizer, epoch, device, args)
 
         # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, args)
+        acc1 = validate(val_loader, model, criterion, args, epoch)
         
         scheduler.step()
         
@@ -368,14 +402,17 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
-
+        if i % args.log_freq == 0:  # Log every log_freq batches.
+                    writer.add_scalar('Loss/train', loss.item(), epoch * len(train_loader) + i)
+                    writer.add_scalar('Accuracy/train_top1', acc1[0], epoch * len(train_loader) + i)
+                    writer.add_scalar('Accuracy/train_top5', acc5[0], epoch * len(train_loader) + i)
         if i % args.print_freq == 0:
             progress.display(i + 1)
 
 
-def validate(val_loader, model, criterion, args):
+def validate(val_loader, model, criterion, args, epoch):
 
-    def run_validate(loader, base_progress=0):
+    def run_validate(loader, epoch, base_progress=0):
         with torch.no_grad():
             end = time.time()
             for i, (images, target) in enumerate(loader):
@@ -401,7 +438,10 @@ def validate(val_loader, model, criterion, args):
                 # measure elapsed time
                 batch_time.update(time.time() - end)
                 end = time.time()
-
+                if i % args.log_freq == 0:  # Log every log_freq batches.
+                            writer.add_scalar('Loss/val', loss.item(), epoch * len(val_loader) + i)
+                            writer.add_scalar('Accuracy/val_top1', acc1[0], epoch * len(val_loader) + i)
+                            writer.add_scalar('Accuracy/val_top5', acc5[0], epoch * len(val_loader) + i)
                 if i % args.print_freq == 0:
                     progress.display(i + 1)
 
@@ -417,7 +457,7 @@ def validate(val_loader, model, criterion, args):
     # switch to evaluate mode
     model.eval()
 
-    run_validate(val_loader)
+    run_validate(val_loader, epoch=epoch)
     if args.distributed:
         top1.all_reduce()
         top5.all_reduce()
