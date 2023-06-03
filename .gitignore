@@ -1,3 +1,9 @@
 *.png
 *.md
 train
+val
+*.tar
+diff
+*.txt
+*.pt
+*.tar

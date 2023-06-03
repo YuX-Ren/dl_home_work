@@ -24,7 +24,7 @@ from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import Subset
 
 from torch.utils.tensorboard import SummaryWriter
-writer = SummaryWriter()
+writer = SummaryWriter("/output/logs")
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -58,7 +58,7 @@ parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float,
                     dest='weight_decay')
 parser.add_argument('-p', '--print-freq', default=10, type=int,
                     metavar='N', help='print frequency (default: 10)')
-parser.add_argument('-p', '--log-freq', default=10, type=int,
+parser.add_argument('-log-freq', '--log-freq', default=10, type=int,
                     metavar='N', help='print frequency (default: 10)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
@@ -87,39 +87,14 @@ parser.add_argument('--dummy', action='store_true', help="use fake data to bench
 
 best_acc1 = 0
 
-def log_layer_sizes(model, input_tensor):
-    layer_sizes = {}
-
-    def get_layer_output_size(module, input, output):
-        layer_sizes[module.__class__.__name__] = output.shape[1]
-
-    # Register the forward hooks
-    handles = []
-    for name, layer in model.named_modules():
-        handle = layer.register_forward_hook(get_layer_output_size)
-        handles.append(handle)
-
-    # Do a forward pass
-    with torch.no_grad():
-        model(input_tensor)
-
-    # Remove the forward hooks
-    for handle in handles:
-        handle.remove()
-
-    # Log the sizes
-    for layer_name, size in layer_sizes.items():
-        writer.add_scalar(f'{layer_name}_output_size', size)
-
-
 
 
 class TinyImageNetDataset(torch.utils.data.Dataset):
     def __init__(self, main_dir, class_to_id, transform=None):
         self.main_dir = main_dir
         self.transform = transform
-        self.all_imgs = os.listdir(main_dir)
         self.imgs_dir = os.path.join(main_dir, "images")
+        self.all_imgs = os.listdir(self.imgs_dir)
         self.class_to_id = class_to_id
 
         self.annotations = {}
@@ -324,7 +299,14 @@ def main_worker(gpu, ngpus_per_node, args):
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
         num_workers=args.workers, pin_memory=True, sampler=train_sampler)
     example_images, _ = next(iter(train_loader))
-    log_layer_sizes(model, example_images)
+        # Extract the underlying model from the DistributedDataParallel wrapper
+    if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+        model_to_add = model.module
+    else:
+        model_to_add = model
+
+    writer.add_graph(model_to_add, example_images.to(next(model_to_add.parameters()).device))
+
     val_loader = torch.utils.data.DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False,
         num_workers=args.workers, pin_memory=True, sampler=val_sampler)
@@ -410,7 +392,7 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
             progress.display(i + 1)
 
 
-def validate(val_loader, model, criterion, args, epoch):
+def validate(val_loader, model, criterion, args, epoch=0):
 
     def run_validate(loader, epoch, base_progress=0):
         with torch.no_grad():
@@ -475,7 +457,7 @@ def validate(val_loader, model, criterion, args, epoch):
     return top1.avg
 
 
-def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
+def save_checkpoint(state, is_best, filename='/output/checkpoint.pth.tar'):
     torch.save(state, filename)
     if is_best:
         shutil.copyfile(filename, 'model_best.pth.tar')
